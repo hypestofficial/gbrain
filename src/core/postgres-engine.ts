@@ -31,6 +31,11 @@ import {
   normalizeDimension,
   isNovelDimension,
 } from './chronicle/ontology.ts';
+import {
+  resolveArmTimeoutMs,
+  resolveArmTimeoutMsFromEnv,
+  SEARCH_ARM_TIMEOUT_CONFIG_KEY,
+} from './search/arm-timeout.ts';
 import { logDbDisconnect } from './audit/db-disconnect-audit.ts';
 import { logPoolRecovery } from './audit/pool-recovery-audit.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
@@ -139,6 +144,14 @@ export function getPostgresSchema(
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
   private _sql: ReturnType<typeof postgres> | null = null;
+  /**
+   * Cached per-arm search `statement_timeout` (ms). Resolved once per engine
+   * because every recall arm needs it and a config round-trip per arm would
+   * add a query to the hot search path. Env still wins on each read, so an
+   * incident-time `GBRAIN_SEARCH_ARM_TIMEOUT_MS` takes effect without a
+   * reconnect. See `search/arm-timeout.ts`.
+   */
+  private _armTimeoutMs: number | null = null;
   /** Saved config for reconnection. */
   private _savedConfig: (EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }) | null = null;
   /** Whether a reconnect is in progress (prevents concurrent reconnects). */
@@ -2127,9 +2140,12 @@ export class PostgresEngine implements BrainEngine {
     // the GUC can never leak onto a pooled connection). Flag off → the
     // wrap is identical to master's; flag on → set_config('app.scopes')
     // shares the same transaction as the timeout.
+    // Resolved outside the transaction so the (memoised) config lookup never
+    // runs while holding a pooled connection.
+    const armTimeoutMs = await this.resolveSearchArmTimeoutMs();
     const runKeyword = (queryText: string) =>
       this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-        await tx`SET LOCAL statement_timeout = '8s'`;
+        await tx.unsafe(`SET LOCAL statement_timeout = ${armTimeoutMs}`);
         const boundParams = [...params];
         boundParams[0] = queryText;
         return await tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
@@ -2273,9 +2289,10 @@ export class PostgresEngine implements BrainEngine {
     // the SET LOCAL statement_timeout needs a transaction regardless of the
     // GBRAIN_RLS_SCOPE_BINDING flag). The OR retry re-executes through the
     // same scoped wrapper.
+    const armTimeoutMs = await this.resolveSearchArmTimeoutMs();
     const runTitles = (queryText: string) =>
       this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-        await tx`SET LOCAL statement_timeout = '8s'`;
+        await tx.unsafe(`SET LOCAL statement_timeout = ${armTimeoutMs}`);
         const boundParams = [...params];
         boundParams[0] = queryText;
         return await tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
@@ -2427,8 +2444,9 @@ export class PostgresEngine implements BrainEngine {
     // RLS scope binding + search-only timeout. alwaysTransaction: master
     // already wrapped this in sql.begin() for the SET LOCAL; flag off is
     // identical to that wrap, flag on adds set_config in the same tx.
+    const armTimeoutMs = await this.resolveSearchArmTimeoutMs();
     const rows = await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-      await tx`SET LOCAL statement_timeout = '8s'`;
+      await tx.unsafe(`SET LOCAL statement_timeout = ${armTimeoutMs}`);
       return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
     }, { alwaysTransaction: true });
     return rows.map(rowToSearchResult);
@@ -2437,14 +2455,16 @@ export class PostgresEngine implements BrainEngine {
   /**
    * #3986: CJK keyword fallback (parity port of PGLite's v0.32.7 branch).
    * SQL builds in the shared cjk-keyword-sql.ts; execution goes through the
-   * same scoped read transaction (RLS scope binding + 8s statement timeout)
-   * as the FTS keyword paths. See src/core/postgres-engine/cjk-search.ts.
+   * same scoped read transaction (RLS scope binding + configurable per-arm
+   * statement timeout, see `resolveSearchArmTimeoutMs`) as the FTS keyword
+   * paths. See src/core/postgres-engine/cjk-search.ts.
    */
   private async _searchKeywordCJK(query: string, ctx: CjkKeywordCtx): Promise<SearchResult[]> {
+    const armTimeoutMs = await this.resolveSearchArmTimeoutMs();
     return searchKeywordCJKImpl(
       async (sqlText, params) =>
         await this.withScopedReadTransaction(ctx.opts?.sourceIds, ctx.opts?.sourceId, async (tx) => {
-          await tx`SET LOCAL statement_timeout = '8s'`;
+          await tx.unsafe(`SET LOCAL statement_timeout = ${armTimeoutMs}`);
           return await tx.unsafe(sqlText, params as Parameters<typeof tx.unsafe>[1]) as unknown as Record<string, unknown>[];
         }, { alwaysTransaction: true }),
       query,
@@ -2651,16 +2671,16 @@ export class PostgresEngine implements BrainEngine {
     // 40), so the inner CTE's LIMIT past 40 was silently unreachable — see
     // hnswEfSearchFor. Transaction-local (is_local=true); non-HNSW plans
     // (seq scan, or corpora without the index) ignore the GUC.
-    //
     // v0.46.15 bounded escalation (identical logic in pglite-engine —
     // engine-parity pinned): retry ×4 up to 3 times while the PAGE set is
     // short but the pre-collapse candidate pool was FULL. A short page with
     // a non-full pool is a genuine final page (corpus/filter exhausted) —
     // no retry, no event. Zero rows with offset>0 escalates (deep
     // pagination) but never emits: pool state is unknowable there.
+    const armTimeoutMs = await this.resolveSearchArmTimeoutMs();
     const runOnce = async (il: number) =>
       await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-        await tx`SET LOCAL statement_timeout = '8s'`;
+        await tx.unsafe(`SET LOCAL statement_timeout = ${armTimeoutMs}`);
         await tx`SELECT set_config('hnsw.ef_search', ${String(hnswEfSearchFor(il))}, true)`;
         return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
       }, { alwaysTransaction: true });
@@ -5761,7 +5781,38 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
+  /**
+   * Per-arm search `statement_timeout` in ms (see `search/arm-timeout.ts`).
+   *
+   * Env is re-read every call so an incident-time override applies without a
+   * reconnect; the config tier is fetched once and memoised, because this runs
+   * on every recall arm of every search and must not add a query per arm.
+   *
+   * Fail-open: if the config read throws (transient pooler drop), we fall back
+   * to the default rather than propagating — a search should degrade to the
+   * old fixed budget, never fail outright, on a tuning lookup.
+   */
+  private async resolveSearchArmTimeoutMs(): Promise<number> {
+    const fromEnv = resolveArmTimeoutMsFromEnv();
+    if (fromEnv !== null) return fromEnv;
+    if (this._armTimeoutMs !== null) return this._armTimeoutMs;
+    let raw: string | null = null;
+    try {
+      raw = await this.getConfig(SEARCH_ARM_TIMEOUT_CONFIG_KEY);
+    } catch {
+      // Leave `raw` null → resolveArmTimeoutMs falls through to the default.
+      // Deliberately not cached, so a later call retries the lookup.
+      return resolveArmTimeoutMs(null);
+    }
+    this._armTimeoutMs = resolveArmTimeoutMs(raw);
+    return this._armTimeoutMs;
+  }
+
   async setConfig(key: string, value: string): Promise<void> {
+    // Drop the memoised search-arm budget so `gbrain config set
+    // search.arm_timeout_ms …` takes effect on this engine's next search
+    // instead of only after a restart.
+    if (key === SEARCH_ARM_TIMEOUT_CONFIG_KEY) this._armTimeoutMs = null;
     return this.connRetry(async () => {
       await this.sql`
         INSERT INTO config (key, value) VALUES (${key}, ${value})
