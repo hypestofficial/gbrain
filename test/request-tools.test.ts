@@ -95,13 +95,32 @@ describe('request_tools catalog (no args)', () => {
     expect(raw).not.toContain('advisor');
   });
 
-  test('stdio transport: localOnly listed (D7) and publish gates bypassed (local surface)', async () => {
+  test('stdio transport: localOnly listed (D7) but gate-off publish-gated ops hidden', async () => {
+    // Two distinct axes: stdio IS the local pipe (locality — localOnly ops
+    // dispatch there, so they list), but publish-gate enforcement exempts
+    // only remote === false and stdio dispatches remote:true — a gate-off op
+    // in this catalog would deny at call time (the listed-but-denied class).
     const res = await dispatchToolCall(engine, 'request_tools', {}, {
       remote: true, transport: 'stdio', sourceId: 'default',
     });
     const names = flatNames(parsed(res).catalog);
     expect(names).toContain('file_list');
-    expect(names).toContain('list_skills');
+    expect(names).not.toContain('list_skills');
+    expect(names).not.toContain('advisor');
+  });
+
+  test('stdio transport: gated ops appear once their gate is on (DB plane)', async () => {
+    await engine.setConfig('mcp.publish_skills', 'true');
+    try {
+      const res = await dispatchToolCall(engine, 'request_tools', {}, {
+        remote: true, transport: 'stdio', sourceId: 'default',
+      });
+      const names = flatNames(parsed(res).catalog);
+      expect(names).toContain('list_skills');
+      expect(names).not.toContain('advisor'); // separate gate, still off
+    } finally {
+      await engine.setConfig('mcp.publish_skills', 'false');
+    }
   });
 
   test('trusted local CLI (remote === false, no transport): localOnly + gated ops visible', async () => {
@@ -134,7 +153,13 @@ describe('request_tools catalog (no args)', () => {
       ...HTTP, auth: authFor('agent-client', ['agent']),
     });
     const names = flatNames(parsed(res).catalog).sort();
-    expect(names).toEqual(['get_agent_job', 'request_tools', 'submit_agent']);
+    // #4098: the generic queue ops (get/list/progress/cancel) are
+    // agentCallable with an owner-client fence, so the honest agent-lane
+    // catalog includes them alongside the submit_agent/get_agent_job pair.
+    expect(names).toEqual([
+      'cancel_job', 'get_agent_job', 'get_job', 'get_job_progress',
+      'list_jobs', 'request_tools', 'submit_agent',
+    ]);
   });
 
   test('D9: a slug-bound client keeps discovery; unfenceable writes stay hidden', async () => {

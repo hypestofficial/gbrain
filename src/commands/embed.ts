@@ -1,10 +1,12 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
+import { currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
+import { carryChunkMetadata, probeEmbedder } from '../core/embed-stale.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
+import { invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-invalidation.ts';
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
@@ -21,8 +23,39 @@ import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
 import { AITransientError } from '../core/ai/errors.ts';
 import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
-import { titleTierCorpusGeneration } from '../core/contextual-retrieval-service.ts';
-import type { Page } from '../core/types.ts';
+import {
+  restampIfDemotedToTitleTier,
+  embedBatchWithBackoff,
+  isEmbedRetriableError,
+  isTransientNetworkEmbedError,
+  type EmbedBatchWithBackoffOpts,
+} from '../core/embed-retry.ts';
+
+// Peeled to src/core/embed-retry.ts (core→commands layering fix: core modules
+// import-file.ts / embed-stale.ts consume these, and a commands module in
+// their value closure risks a real ESM cycle). Façade rule: embed.ts keeps
+// re-exporting its historical surface so import sites and tests never chase
+// the peel.
+export {
+  restampIfDemotedToTitleTier,
+  MAX_RATE_LIMIT_RETRIES,
+  RATE_LIMIT_FALLBACK_MS,
+  RATE_LIMIT_PAD_MS,
+  RATE_LIMIT_JITTER,
+  detect429FromCause,
+  detectGatewayErrorFromCause,
+  parseRetryDelayMs,
+  RATE_LIMIT_ATTEMPT_FLOOR_MS,
+  _setRateLimitFloorsForTests,
+  rateLimitDelayMs,
+  abortableSleep,
+  embedBatchWithBackoff,
+  TRANSIENT_NET_BASE_MS,
+  TRANSIENT_NET_MAX_MS,
+  transientBackoffMs,
+  isTransientNetworkEmbedError,
+} from '../core/embed-retry.ts';
+export type { EmbedBatchWithBackoffOpts } from '../core/embed-retry.ts';
 
 /** #3037: cap failure samples so a corpus-wide outage doesn't bloat --json. */
 const FAILURE_SAMPLE_CAP = 10;
@@ -37,23 +70,6 @@ function recordFailure(result: EmbedResult, chunkCount: number, slug: string, e:
   if (result.failure_samples.length < FAILURE_SAMPLE_CAP) {
     result.failure_samples.push(`${slug}: ${e instanceof Error ? e.message : String(e)}`);
   }
-}
-
-/**
- * #3507 — after a plain re-embed fully re-embedded a `per_chunk_synopsis`
- * page at the title-only tier (see wrapChunkTextsForStoredMode), restamp the
- * page's CR state to 'title' so `contextual_retrieval_mode` keeps describing
- * the vectors actually in the column. The reindex sweep restores the synopsis
- * tier later. No-op for every other mode.
- */
-export async function restampIfDemotedToTitleTier(
-  engine: BrainEngine,
-  page: Pick<Page, 'contextual_retrieval_mode'> | null | undefined,
-  slug: string,
-  sourceId: string,
-): Promise<void> {
-  if (page?.contextual_retrieval_mode !== 'per_chunk_synopsis') return;
-  await engine.updatePageContextualRetrievalState(slug, sourceId, 'title', titleTierCorpusGeneration());
 }
 
 export interface EmbedOpts {
@@ -161,6 +177,16 @@ export interface EmbedOpts {
    * `gbrain embed --stale --include-null-signature` set this.
    */
   includeNullSignature?: boolean;
+  /**
+   * Migration-hardening: locks the CALLER already holds (the migration
+   * orchestrator acquires the per-source embed-backfill locks up front, before
+   * the schema transition, and holds them through the drain). When set with
+   * `singleFlight`, the drain does NOT re-acquire the same keys — re-acquiring
+   * would always fail against our own holder and misreport `lock_skipped`
+   * ("Migration paused") on every run. Ownership stays with the caller: this
+   * function refreshes them (heartbeat) but never releases them.
+   */
+  heldLocks?: DbLockHandle[];
 }
 
 /**
@@ -214,6 +240,14 @@ export interface EmbedResult {
    * misreporting embed failures.
    */
   lock_skipped?: boolean;
+  /**
+   * Set when the single-flight lock heartbeat discovered the lock was stolen
+   * (refresh matched 0 rows) or kept erroring: mutual exclusion is gone, so
+   * the drain ABORTED with partial progress banked rather than racing the
+   * new holder. Resumable — re-run the same command once the other holder
+   * finishes (the fenced refresh means we can never steal it back silently).
+   */
+  lock_lost?: boolean;
   /**
    * E1 (paced-backfill): end-of-run pacing telemetry. Present ONLY when pacing
    * was active (enabled bundle). The number the operator could not get from an
@@ -359,8 +393,15 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     // sorted (deterministic) order to avoid acquire-order deadlock. Released in
     // the finally below. Skipped for dryRun and when the caller didn't opt in
     // (cycle / catch-up / sync-auto-embed callers never single-flight).
+    //
+    // Migration hardening: when the caller ALREADY holds the locks
+    // (opts.heldLocks — the migrate-embeddings orchestrator acquires them
+    // before the schema transition), use those instead of re-acquiring — a
+    // re-acquire would always fail against our own holder and misreport
+    // lock_skipped. Ownership stays with the caller (no release here).
     const sfLocks: DbLockHandle[] = [];
-    if (opts.singleFlight && opts.stale && !opts.dryRun) {
+    const callerHeld = opts.heldLocks !== undefined && opts.heldLocks.length > 0;
+    if (callerHeld === false && opts.singleFlight && opts.stale && !opts.dryRun) {
       let lockSourceIds: string[];
       if (opts.sourceId) {
         lockSourceIds = [opts.sourceId];
@@ -398,6 +439,57 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         sfLocks.push(lock);
       }
     }
+
+    // Lock heartbeat (round-2 C3/#5): the TTL is 60 minutes and million-chunk
+    // drains run longer, so without refresh another process could steal the
+    // lock mid-drain and mutual exclusion silently ends. Refresh every 5
+    // minutes; a refresh that returns false (fenced predicate matched 0 rows
+    // = stolen/released) or that keeps THROWING (3 consecutive transient
+    // errors) aborts the drain — continuing without the lock is the one
+    // thing this machinery exists to prevent. Covers both our own sfLocks
+    // and caller-held locks (the migration's).
+    const activeLocks: DbLockHandle[] = callerHeld ? [...(opts.heldLocks ?? [])] : sfLocks;
+    const lockAbort = new AbortController();
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    // Test seam: default 5 min; tests shrink it to exercise the loss path.
+    const heartbeatMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS) > 0
+      ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS)
+      : 5 * 60 * 1000;
+    if (activeLocks.length > 0 && !opts.dryRun) {
+      let consecutiveErrors = 0;
+      let beating = false;
+      heartbeat = setInterval(() => {
+        if (beating) return; // a slow tick must not stack
+        beating = true;
+        void (async () => {
+          try {
+            if (lockAbort.signal.aborted) return;
+            for (const h of activeLocks) {
+              const ok = await h.refresh();
+              if (!ok) {
+                result.lock_lost = true;
+                serr('  [embed] single-flight lock was stolen or released mid-run; aborting the drain (partial progress is banked — re-run to resume).');
+                if (heartbeat !== undefined) clearInterval(heartbeat);
+                lockAbort.abort();
+                return;
+              }
+            }
+            consecutiveErrors = 0;
+          } catch {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= 3) {
+              result.lock_lost = true;
+              serr('  [embed] lock heartbeat failed 3 consecutive times; aborting the drain rather than running without mutual exclusion.');
+              if (heartbeat !== undefined) clearInterval(heartbeat);
+              lockAbort.abort();
+            }
+          } finally {
+            beating = false;
+          }
+        })();
+      }, heartbeatMs);
+    }
+    const drainSignal = anySignal(lockAbort.signal, opts.signal);
 
     // Resolve DB-contention pacing (env > config > bundle; env is the
     // incident escape hatch). dryRun skips it — no writes to pace. A
@@ -442,8 +534,13 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         paceMaxConcurrency,
         quiet: opts.quiet,
         includeNullSignature: opts.includeNullSignature,
-      }, opts.signal);
+      }, drainSignal);
+    } catch (e) {
+      // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
+      // already set + explained on stderr) — not an error to propagate.
+      if (!(result.lock_lost && e instanceof AbortError)) throw e;
     } finally {
+      if (heartbeat !== undefined) clearInterval(heartbeat);
       // E1: surface pacing telemetry (human + structured) when pacing was on.
       const snap = pacer.snapshot();
       if (snap.enabled) {
@@ -562,12 +659,21 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       paramBuilder: (cleanArgs) => {
         const slugsI = cleanArgs.indexOf('--slugs');
         const srcI = cleanArgs.indexOf('--source');
+        const bsI = cleanArgs.indexOf('--batch-size');
+        const bsRaw = bsI >= 0 ? parseInt(cleanArgs[bsI + 1] ?? '', 10) : NaN;
+        const prI = cleanArgs.indexOf('--priority');
         return {
           all: cleanArgs.includes('--all'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
           sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
+          // Background parity (D7): these four used to be silently DROPPED,
+          // degrading the documented recovery command to a plain stale run.
+          catchUp: cleanArgs.includes('--catch-up'),
+          includeNullSignature: cleanArgs.includes('--include-null-signature'),
+          ...(Number.isFinite(bsRaw) && bsRaw > 0 && { batchSize: Math.min(10_000, bsRaw) }),
+          ...(prI >= 0 && cleanArgs[prI + 1] === 'recent' && { priority: 'recent' }),
           // CX1+CX5: carry explicit pace overrides into the `embed` job payload
           // (the job name CLI --background actually submits). The handler
           // re-resolves env > config > bundle at execution.
@@ -703,8 +809,12 @@ async function embedPage(
     }
   }
 
-  // Embed chunks without embeddings
-  const toEmbed = chunks.filter(c => !c.embedded_at);
+  // Embed chunks without embeddings. embedding_is_null is the stored-vector
+  // truth: a schema rebuild NULLs vectors without touching embedded_at, so
+  // keying on embedded_at alone silently no-ops ("all chunks already
+  // embedded") on a rebuild-darkened page. Older callers that selected chunks
+  // without the boolean fall back to embedded_at.
+  const toEmbed = chunks.filter(c => !c.embedded_at || c.embedding_is_null === true);
   result.total_chunks += chunks.length;
   result.skipped += chunks.length - toEmbed.length;
 
@@ -769,7 +879,12 @@ async function embedPage(
   // such a page and then stamps it. #3037: a partial failure leaves failed
   // chunks NULL, so don't stamp then either.
   if (failed === 0 && toEmbed.length === chunks.length) {
-    await engine.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+    // D9 honesty: no stamp when the gateway is unconfigured — a wrong
+    // signature is worse than none (NULL = unknown provenance).
+    const stampSig = currentEmbeddingSignature();
+    if (stampSig) {
+      await engine.setPageEmbeddingSignature(slug, { sourceId, signature: stampSig });
+    }
     // #3507: a fully re-embedded per_chunk_synopsis page landed at the
     // title tier — keep the stamped mode honest.
     await restampIfDemotedToTitleTier(engine, page, slug, page.source_id);
@@ -784,9 +899,11 @@ async function embedPage(
 }
 
 /**
- * Carry code-chunk metadata (language, symbol_name, symbol_type, line range,
- * parent scope, doc comment, qualified name) from a loaded Chunk back into a
- * ChunkInput destined for upsertChunks.
+ * Carry per-chunk metadata — modality (the W0 fix: its omission flipped
+ * image chunks to text) plus the code fields (language, symbol_name,
+ * symbol_type, line range, parent scope, doc comment, qualified name) — from
+ * a loaded Chunk back into a ChunkInput destined for upsertChunks. The
+ * shared carryChunkMetadata list (core/embed-stale.ts) is authoritative.
  *
  * Issue #769: every re-embed used to strip these fields, and upsertChunks
  * overwrites (does not COALESCE) the metadata columns from EXCLUDED, so
@@ -795,17 +912,13 @@ async function embedPage(
  * (embedPage, embedAll non-stale, embedAllStale) in lock-step.
  */
 function preserveCodeMetadata(loaded: any, base: ChunkInput): ChunkInput {
-  return {
-    ...base,
-    language: loaded.language ?? undefined,
-    symbol_name: loaded.symbol_name ?? undefined,
-    symbol_type: loaded.symbol_type ?? undefined,
-    start_line: loaded.start_line ?? undefined,
-    end_line: loaded.end_line ?? undefined,
-    parent_symbol_path: loaded.parent_symbol_path ?? undefined,
-    doc_comment: loaded.doc_comment ?? undefined,
-    symbol_name_qualified: loaded.symbol_name_qualified ?? undefined,
-  };
+  // W0 fix-wave (Tier-1 #3, CONFIRMED): delegate to the single shared carry
+  // list. This local copy was missing `modality`, so every CLI re-embed path
+  // (embedPage, embedAll, embedAllStale) flipped image chunks to
+  // modality='text' — upsertChunks overwrites from EXCLUDED — silently
+  // zeroing image retrieval until the next full import. The minion twin in
+  // core/embed-stale.ts carried it correctly; one list now serves both.
+  return carryChunkMetadata(loaded, base);
 }
 
 async function embedAll(
@@ -833,7 +946,9 @@ async function embedAll(
   // v0.41.31: current embedding provenance signature. Stamped onto pages
   // when their chunks are (re)embedded so a later model/dimension swap is
   // detectable as stale.
-  const signature = currentEmbeddingSignature();
+  // null when the gateway is unconfigured: skip stamping + signature-widened
+  // invalidation entirely (a wrong stamp is worse than none — D9 honesty).
+  const signature = currentEmbeddingSignature() ?? undefined;
   // ─────────────────────────────────────────────────────────────
   // Stale-only fast path: avoid the listPages + per-page getChunks
   // bomb that pulled every page row + every chunk's embedding column
@@ -945,11 +1060,14 @@ async function embedAll(
       await observed(pacer, () => engine.upsertChunks(page.slug, updated, pageOpts));
       // v0.41.31: stamp embedding provenance so a later model swap is
       // detectable as stale. #3037: not on partial failure — failed chunks
-      // stay NULL under unknown provenance.
+      // stay NULL under unknown provenance. D9: no stamp without a gateway
+      // (signature undefined) — a wrong stamp is worse than none.
       if (failed === 0) {
-        await observed(pacer, () =>
-          engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
-        );
+        if (signature) {
+          await observed(pacer, () =>
+            engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
+          );
+        }
         // #3507: --all fully re-embeds; a per_chunk_synopsis page landed at
         // the title tier — keep the stamped mode honest. #3037: gated on
         // failed === 0 — a partially-failed page was NOT fully re-embedded,
@@ -1278,12 +1396,48 @@ async function embedAllStale(
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
   // widened predicate; a live run NULLs them first so the existing
   // NULL-embedding cursor (listStaleChunks) picks them up unchanged.
+  // Guarded (#4306): embed_skip pages keep their retained vectors — every
+  // stale selector excludes them, so NULLing them here (the migrate
+  // embeddings drain path included) would be permanent loss.
+  //
+  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-count
+  // keeps the probe's one embed call off the no-drift common path; a failed
+  // probe (bad key, unreachable provider, wrong-dims model) skips the
+  // invalidation so a misresolved config can't strip vectors it can never
+  // replace. validateEmbeddingCreds at runEmbedCore entry is a static env
+  // check only — the probe is the live proof.
   if (!dryRun && signature) {
-    const invalidated = await engine.invalidateStaleSignatureEmbeddings({
-      signature,
-      ...(sourceId && { sourceId }),
-      ...(includeNullSig && { includeNullSignature: true }),
-    });
+    let signatureDrift = 0;
+    try {
+      const wide = await engine.countStaleChunks({
+        ...sourceOpt, signature, ...(includeNullSig && { includeNullSignature: true }),
+      });
+      const nullOnly = await engine.countStaleChunks(sourceOpt);
+      signatureDrift = wide - nullOnly;
+    } catch {
+      // Pre-count is best-effort; fall through as "no drift" (no NULLing).
+    }
+    let invalidated = 0;
+    if (signatureDrift > 0) {
+      const probeOk = await probeEmbedder(
+        (texts, fnOpts) => embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }),
+        signature,
+        externalSignal,
+      );
+      if (probeOk) {
+        invalidated = await invalidateStaleSignatureEmbeddingsGuarded(engine, {
+          signature,
+          ...(sourceId && { sourceId }),
+          ...(includeNullSig && { includeNullSignature: true }),
+        });
+      } else {
+        serr(
+          `  [embed] WARNING: ${signatureDrift} chunk(s) drifted from signature ${signature} but the ` +
+          `embedder probe failed — SKIPPING invalidation (existing vectors preserved). ` +
+          `Check embedding provider config/credentials.`,
+        );
+      }
+    }
     if (invalidated > 0 && !staleOpts?.quiet) {
       slog(`[embed] invalidated ${invalidated} chunk(s) embedded under a prior model signature`);
     }
@@ -1313,6 +1467,23 @@ async function embedAllStale(
       } catch {
         // The warning probe is best-effort; never break the embed run.
       }
+    }
+  }
+
+  // #4246: invalidate chunks whose embedding was computed from a PREVIOUS
+  // chunk_text revision (embedded_text_hash <> md5(chunk_text)) so content
+  // edits flow through the NULL cursor. NOT probe-gated: the blast radius is
+  // bounded by real content edits (config-independent, unlike signature
+  // drift) and those vectors point at stale text either way. NULL hash
+  // (pre-v133 rows) is grandfathered.
+  if (!dryRun) {
+    try {
+      const drifted = await engine.invalidateContentDriftEmbeddings(sourceId ? { sourceId } : undefined);
+      if (drifted > 0 && !staleOpts?.quiet) {
+        slog(`[embed] invalidated ${drifted} chunk(s) whose text changed after embedding (content drift)`);
+      }
+    } catch {
+      // Best-effort (pre-v133 schema mid-upgrade); the NULL-only loop still runs.
     }
   }
 
@@ -1650,143 +1821,6 @@ async function embedAllStale(
   }
 }
 
-/**
- * v0.33.3: rate-limit-aware embedBatch wrapper.
- *
- * The OpenAI SDK has built-in retry with exponential backoff, but its
- * backoff window (max ~4s) is too short for TPM (tokens-per-minute)
- * rate limits on large pages (~90K tokens).  This wrapper catches
- * 429-shaped errors, parses the retry delay from the error message
- * (e.g. "Please try again in 248ms"), and sleeps before retrying.
- *
- * v0.33.4 hardening (codex + re-review findings):
- *   - D4: detect 429 via the wrapped error's `cause.status` (the gateway's
- *     normalizeAIError stores the original error there). Bare `e.status`
- *     never fires against an `AITransientError` wrap. Message-match stays
- *     as a fallback.
- *   - D4a: pass `maxRetries: 0` through `embedBatch` so the AI SDK's
- *     default 2-retry stack doesn't multiply this wrapper's 5 attempts.
- *   - D2: jitter the parsed delay ±30% so 20 concurrent workers don't
- *     resynchronize on the next 429 wave.
- *   - D3a/D8: when an external AbortSignal fires (wall-clock budget), the
- *     sleep wakes up early AND the abortSignal is threaded into the gateway
- *     embed call so an in-flight HTTP request cancels too.
- *
- * Up to MAX_RATE_LIMIT_RETRIES attempts with the parsed (jittered) delay
- * (or a 60s fallback when the message can't be parsed).
- *
- * @internal Exported for unit tests; not part of the public surface.
- */
-export const MAX_RATE_LIMIT_RETRIES = 5;
-export const RATE_LIMIT_FALLBACK_MS = 60_000;
-export const RATE_LIMIT_PAD_MS = 500;
-export const RATE_LIMIT_JITTER = 0.3;
-
-export interface EmbedBatchWithBackoffOpts {
-  abortSignal?: AbortSignal;
-}
-
-/**
- * Walk the cause chain looking for a 429 status. The current
- * `normalizeAIError` wraps once into `AITransientError` with `cause = original`,
- * so one level is sufficient — but iterate to handle future wrap layers
- * defensively (max 5 levels to bound a malformed cyclic chain).
- *
- * @internal exported for unit tests.
- */
-export function detect429FromCause(e: unknown): boolean {
-  let cur: unknown = e;
-  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
-    const obj = cur as { status?: unknown; statusCode?: unknown; cause?: unknown };
-    if (obj.status === 429 || obj.statusCode === 429) return true;
-    cur = obj.cause;
-  }
-  return false;
-}
-
-/**
- * Parse a Retry-After hint out of an OpenAI-style 429 message. Falls back
- * to `RATE_LIMIT_FALLBACK_MS` when the message can't be parsed. Adds
- * `RATE_LIMIT_PAD_MS` padding and `RATE_LIMIT_JITTER` randomization so
- * concurrent workers don't resynchronize.
- *
- * @internal exported for unit tests.
- */
-export function parseRetryDelayMs(msg: string, rng: () => number = Math.random): number {
-  let delayMs = RATE_LIMIT_FALLBACK_MS;
-  const msMatch = msg.match(/try again in (\d+)ms/i);
-  const secMatch = msg.match(/try again in ([\d.]+)s/i);
-  if (msMatch) delayMs = parseInt(msMatch[1], 10) + RATE_LIMIT_PAD_MS;
-  else if (secMatch) delayMs = Math.ceil(parseFloat(secMatch[1]) * 1000) + RATE_LIMIT_PAD_MS;
-  // D2: ±30% jitter to decorrelate the herd of 20 workers.
-  const jitterFactor = 1 + (rng() * 2 - 1) * RATE_LIMIT_JITTER;
-  return Math.max(1, Math.floor(delayMs * jitterFactor));
-}
-
-/**
- * Sleep for `ms` milliseconds. Resolves early (not rejects) when `signal`
- * fires, so the retry loop's caller can re-check `signal.aborted` and
- * exit cleanly without an unhandled rejection.
- *
- * @internal exported for unit tests.
- */
-export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-export async function embedBatchWithBackoff(
-  texts: string[],
-  opts: EmbedBatchWithBackoffOpts = {},
-): Promise<Float32Array[]> {
-  const signal = opts.abortSignal;
-  for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
-    if (signal?.aborted) throw new Error('embed budget aborted');
-    try {
-      // D4a + D8: maxRetries:0 disables the SDK's stacked retries (so this
-      // wrapper is the single source of truth) and abortSignal threads
-      // through to the gateway so an in-flight HTTP request cancels mid-fetch.
-      return await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
-    } catch (e: unknown) {
-      // If the budget fired we may have been aborted mid-fetch; bubble out.
-      if (signal?.aborted) throw e;
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!isRateLimitError(e) || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
-
-      const delayMs = parseRetryDelayMs(msg);
-      serr(`  [rate-limit] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
-      await abortableSleep(delayMs, signal);
-    }
-  }
-  // Unreachable, but TypeScript needs it.
-  return embedBatch(texts);
-}
-
-/**
- * 429 judgment shared by embedBatchWithBackoff (retry decision) and
- * embedPageTexts (fan-out decision). D4: structured detection first
- * (gateway-wrapped errors via cause chain); message-match as fallback for
- * providers whose wrappers strip `cause.status`.
- */
-function isRateLimitError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  return detect429FromCause(e) || /rate.?limit|429/i.test(msg);
-}
-
 /** Walk the cause chain (like detect429FromCause) for the first HTTP status. */
 function statusFromCause(e: unknown): number | undefined {
   let cur: unknown = e;
@@ -1835,7 +1869,9 @@ async function embedPageTexts(
   } catch (e: unknown) {
     if (opts.abortSignal?.aborted) throw e; // shutdown, not a chunk problem
     if (texts.length <= 1) throw e; // nothing to isolate
-    if (isRateLimitError(e) || e instanceof AITransientError) throw e;
+    // #3374 — network-transient exhaustion isn't chunk-specific either:
+    // fanning out during an outage multiplies failing calls per page.
+    if (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError) throw e;
     const status = statusFromCause(e);
     if (status === 401 || status === 403) throw e;
 

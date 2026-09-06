@@ -15,6 +15,15 @@
 // No brace expansion, no ?, no [ ].
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
+  // Serve-delegated sync: wire types, job runner, CLI ladder, and the IPC
+  // plumbing all feed the delegation-under-serve E2E.
+  "src/core/context/sync-ipc.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/core/serve-sync-runner.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/commands/sync-delegate.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/core/context/resolve-ipc.ts": [
+    "test/e2e/bootstrap-hook-under-serve.serial.test.ts",
+    "test/e2e/sync-delegation-under-serve.serial.test.ts",
+  ],
   // Source-aware ranking, hybrid search, intent classification.
   "src/core/search/**": [
     "test/e2e/search-quality.test.ts",
@@ -51,6 +60,18 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/cycle/synthesize.ts": [
     "test/e2e/multi-source-bug-class.test.ts",
     "test/e2e/synthesize-bigint-job-id-postgres.test.ts",
+    "test/e2e/dream-synthesize-pglite.test.ts",
+  ],
+  // The inline drain claims from MinionQueue, so its entry must be a SUPERSET:
+  // the drain suite plus the full minions e2e set — a narrower list would
+  // reduce coverage vs the fail-closed run-everything default for unmapped paths.
+  "src/core/cycle/inline-drain.ts": [
+    "test/e2e/dream-synthesize-pglite.test.ts",
+    "test/e2e/minions-concurrency.test.ts",
+    "test/e2e/minions-resilience.test.ts",
+    "test/e2e/minions-shell.test.ts",
+    "test/e2e/minions-shell-pglite.test.ts",
+    "test/e2e/worker-abort-recovery.test.ts",
   ],
   "src/commands/embed.ts": [
     "test/e2e/multi-source-bug-class.test.ts",
@@ -87,6 +108,21 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
   ],
+  // Engine method modules peeled from the façades carry the same blast
+  // radius as the façades themselves.
+  "src/core/postgres-engine/**": [
+    "test/e2e/postgres-bootstrap.test.ts",
+    "test/e2e/postgres-jsonb.test.ts",
+    "test/e2e/jsonb-roundtrip.test.ts",
+    "test/e2e/engine-parity.test.ts",
+    "test/e2e/schema-drift.test.ts",
+    "test/e2e/migrate-embeddings-postgres.test.ts",
+  ],
+  "src/core/pglite-engine/**": [
+    "test/e2e/postgres-bootstrap.test.ts",
+    "test/e2e/engine-parity.test.ts",
+    "test/e2e/schema-drift.test.ts",
+  ],
   // Schema source of truth: any change must pass the cross-engine drift gate.
   "src/schema.sql": ["test/e2e/schema-drift.test.ts"],
   "src/core/pglite-schema.ts": ["test/e2e/schema-drift.test.ts"],
@@ -106,6 +142,8 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/migration-flow.test.ts",
   ],
   "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts"],
+  // Doctor check modules peeled from doctor.ts feed the same e2e surface.
+  "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts"],
   // Knowledge graph layer feeds graph-quality.
   "src/core/link-extraction.ts": ["test/e2e/graph-quality.test.ts"],
   // v0.38 ingestion substrate. POST /ingest lives inside serve-http.ts

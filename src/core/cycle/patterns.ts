@@ -23,10 +23,12 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
-import { MinionQueue } from '../minions/queue.ts';
-import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
+import { DEFAULT_PRIVATE_QUEUE_LEASE_MS, MinionQueue } from '../minions/queue.ts';
+import { isQueueQuotaExceededError } from '../minions/admission.ts';
+import { waitForCompletionRenewing, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { truncateUtf8 } from '../text-safe.ts';
 import type { Page, PageType } from '../types.ts';
 // #2415: allow-list + output-root resolution shared with the synthesize
 // phase — both phases must agree on the configured namespace.
@@ -66,6 +68,8 @@ export interface PatternsPhaseOpts {
    * row. Unset → legacy 'default'. Mirrors synthesize.ts's `sourceId`.
    */
   sourceId?: string;
+  /** Internal: minion owner job id for private dream-inline queue recovery. */
+  privateQueueOwnerJobId?: number | null;
 }
 
 /**
@@ -75,8 +79,13 @@ export interface PatternsPhaseOpts {
  * wait returns and the handler unwinds cleanly before the worker's abort
  * fires: wait poll interval (5s) + worker force-evict grace (30s) + lock
  * and DB cleanup headroom.
+ *
+ * gbrain#4168: the canonical definition moved to base-phase.ts (one home for
+ * every phase); re-exported here so existing imports (tests included) keep
+ * working.
  */
-export const CYCLE_DEADLINE_RESERVE_MS = 60 * 1000;
+import { CYCLE_DEADLINE_RESERVE_MS } from './base-phase.ts';
+export { CYCLE_DEADLINE_RESERVE_MS };
 
 /**
  * Smallest remaining budget worth submitting a subagent for. Below this,
@@ -115,6 +124,7 @@ export async function runPhasePatterns(
   opts: PatternsPhaseOpts,
 ): Promise<PhaseResult> {
   const start = Date.now();
+  let ownedPrivateQueue: { queue: MinionQueue; name: string } | null = null;
   try {
     const config = await loadPatternsConfig(engine);
 
@@ -161,7 +171,7 @@ export async function runPhasePatterns(
       return skipped('no_provider', `pattern detection skipped: ${probe.detail}`);
     }
 
-    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot);
+    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot, engine);
     if (allowedSlugPrefixes.length === 0) {
       return failed(makeError('InternalError', 'NO_ALLOWLIST',
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
@@ -197,10 +207,22 @@ export async function runPhasePatterns(
     // never claim a child this parent is about to run itself. Mirrors
     // synthesize.ts's childQueueName derivation exactly.
     const childQueueName = `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    ownedPrivateQueue = { queue, name: childQueueName };
+    const privateQueueOwnerToken = randomUUID();
+    // Same lease posture as synthesize: rolling 10-min default lease renewed
+    // every ≤30s (drain loop + chunked post-drain wait); the whole wrapper is
+    // 30s-throttled so idle polls cost one UPDATE per half-minute.
+    const renewPrivateQueueLease = queue.makeThrottledLeaseRenewer(
+      childQueueName, privateQueueOwnerToken, opts.yieldDuringPhase,
+    );
     const data: SubagentHandlerData = {
       prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
       model: config.model,
       max_turns: 30,
+      // #4217/CDX-12: a patterns child whose every put_page failed must
+      // dead-letter (its whole purpose is writing pattern pages), not report
+      // completed with zero pages.
+      require_writes: true,
       allowed_slug_prefixes: allowedSlugPrefixes,
       // #1586: scope every child tool call to the cycle's resolved source so
       // put_page writes land there instead of the hardcoded 'default'.
@@ -210,22 +232,37 @@ export async function runPhasePatterns(
       max_stalled: 3,
       timeout_ms: budgets.timeoutMs,
       queue: childQueueName,
+      private_queue_owner_job_id: opts.privateQueueOwnerJobId ?? null,
+      private_queue_owner_token: privateQueueOwnerToken,
+      private_queue_lease_ms: DEFAULT_PRIVATE_QUEUE_LEASE_MS,
     };
-    const job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
-      allowProtectedSubmit: true,
-    });
+    let job: Awaited<ReturnType<typeof queue.add>>;
+    try {
+      job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
+        allowProtectedSubmit: true,
+      });
+    } catch (e) {
+      // Admission quota (minions.quota_max_waiting.subagent, config-only): a
+      // rejected submit is a recorded phase SKIP, never a phase crash — the
+      // next cycle retries once the backlog drains.
+      if (isQueueQuotaExceededError(e)) {
+        return skipped('admission_quota', e.message);
+      }
+      throw e;
+    }
 
     // Drain this phase's private child queue inline so the parent observes
     // the terminal state instead of polling waitForCompletion until
     // subagentWaitTimeoutMs expires. Runs on BOTH engines — on Postgres the
     // parent job otherwise deadlocks a fully-occupied worker (#2050).
-    await runSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
+    await runSubagentsInline(engine, queue, childQueueName, renewPrivateQueueLease);
 
     let outcome: MinionJobStatus | 'timeout';
     try {
-      const final = await waitForCompletion(queue, job.id, {
+      const final = await waitForCompletionRenewing(queue, job.id, {
         timeoutMs: budgets.waitTimeoutMs,
         pollMs: 5 * 1000,
+        renew: renewPrivateQueueLease,
       });
       outcome = final.status;
     } catch (e) {
@@ -304,6 +341,24 @@ export async function runPhasePatterns(
     return failed(makeError('InternalError', 'PATTERNS_PHASE_FAIL',
       e instanceof Error ? (e.message || 'patterns phase threw') : String(e)));
   } finally {
+    if (ownedPrivateQueue) {
+      try {
+        const cancelled = await ownedPrivateQueue.queue.reconcilePrivateQueue(
+          ownedPrivateQueue.name,
+          'private queue owner terminalized: patterns phase ended',
+        );
+        if (cancelled.length > 0) {
+          process.stderr.write(
+            `[dream] patterns reconciled ${cancelled.length} non-terminal child job(s) from ${ownedPrivateQueue.name}\n`,
+          );
+        }
+      } catch (cleanupError) {
+        process.stderr.write(
+          `[dream] patterns private-queue cleanup failed for ${ownedPrivateQueue.name}: ` +
+          `${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}\n`,
+        );
+      }
+    }
     void start;
   }
 }
@@ -419,7 +474,11 @@ async function gatherReflections(
   return rows.map(r => ({
     slug: r.slug,
     title: r.title ?? r.slug,
-    excerpt: (r.compiled_truth ?? '').slice(0, 600),
+    // A raw UTF-16 slice can split an astral character at the boundary and
+    // leave a lone surrogate. Postgres rejects that when the prompt is bound
+    // into the minion job's JSONB payload. Use the shared safe truncator so a
+    // reflection containing emoji cannot abort the entire patterns phase.
+    excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
   }));
 }
 
@@ -577,6 +636,7 @@ function makeError(cls: string, code: string, message: string, hint?: string): P
 // source-scoping contract (#1586) without driving a whole dream cycle.
 // Mirrors synthesize.ts's `__testing` block.
 export const __testing = {
+  gatherReflections,
   collectChildPutPageSlugs,
   reverseWriteRefs,
 };

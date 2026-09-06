@@ -76,6 +76,7 @@ const CODE_EXTENSIONS = new Set<string>([
   '.sh', '.bash',
   '.css',
   '.html', '.htm',
+  '.astro', '.svelte',
   '.vue',
   '.json',
   '.yaml', '.yml',
@@ -261,7 +262,14 @@ function isMultimodalEnabled(): boolean {
 }
 
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
-  if (strategy === 'markdown') return isMarkdownFilePath(path);
+  // #2683: mirror import.ts's isCollectibleForWalker — the full-sync walker
+  // admits images under the (default) 'markdown' strategy when multimodal is
+  // on, but this incremental gate used to be markdown-only, so a committed
+  // image NEVER imported incrementally (it only landed via `sync --full`).
+  // Full and incremental must agree on the admission set.
+  if (strategy === 'markdown') {
+    return isMarkdownFilePath(path) || (isMultimodalEnabled() && isImageFilePath(path));
+  }
   if (strategy === 'code') return isCodeFilePath(path);
   // 'auto' / default: markdown + code, plus images when multimodal is on.
   return (
@@ -403,7 +411,63 @@ export type SyncableReason =
   | 'strategy'
   | 'pruned-dir'
   | 'include-glob-miss'
-  | 'exclude-glob-hit';
+  | 'exclude-glob-hit'
+  | 'malformed-path';
+
+/**
+ * Path segments that can never be legitimate page filenames: square brackets
+ * (the signature of markdown-link syntax leaking into a literal filename —
+ * files named `[atoms/foo.md](https:/...)` were minted by misbehaving
+ * producers and polluted search because slugifySegment STRIPS brackets
+ * instead of rejecting them, yielding plausible-looking slugs) and ASCII
+ * control characters. Parentheses are deliberately allowed — `meeting (1).md`
+ * is a legitimate filename shape.
+ *
+ * Two-tier design (cross-model adversarial finding — both reviewers flagged
+ * blanket-bracket collateral):
+ *   - ADMISSION (hasMalformedPathSegment): control chars reject on ANY path;
+ *     brackets reject only on MARKDOWN paths (.md/.mdx). Code-strategy lanes
+ *     keep indexing framework paths like `app/[id]/page.tsx`, which are
+ *     ubiquitous and legitimate.
+ *   - DESTRUCTION (isPoisonedPath): sync's row-DELETING lanes (reconcile,
+ *     modified-lane cleanup) act only on the actual injection signature —
+ *     `](` or control chars. A bare-bracket markdown file (`notes [draft].md`)
+ *     imported by a pre-gate release keeps its indexed row (it just can't
+ *     re-import until renamed; doctor's malformed_path_pages carries the
+ *     hint). Hard-deleting it on a routine post-upgrade full sync while the
+ *     file still exists would be silent data loss.
+ *
+ * IMPORTANT: these are PATH checks only. `](` inside file BODIES is normal
+ * markdown and must never trip them.
+ */
+export const MALFORMED_PATH_SEGMENT_RE = /[\[\]\x00-\x1f]/;
+
+/** The injection signature that marks a path as sweepable junk. */
+export const POISONED_PATH_RE = /\]\(|[\x00-\x1f]/;
+
+/** Admission check: control chars anywhere; brackets on markdown paths. */
+export function hasMalformedPathSegment(path: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(path)) return true;
+  return /[\[\]]/.test(path) && /\.(md|mdx)$/i.test(path);
+}
+
+/** Destruction gate: only paths matching the poison signature may have their DB rows swept. */
+export function isPoisonedPath(path: string): boolean {
+  return POISONED_PATH_RE.test(path);
+}
+
+/**
+ * Strip control characters (and cap length) before echoing a malformed path
+ * to a terminal — these paths contain control bytes BY DEFINITION, and a
+ * crafted filename must not be able to inject ANSI escapes into sync output.
+ * Brackets stay: they're printable and the informative part of the name.
+ */
+export function sanitizePathForDisplay(path: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = path.replace(/[\x00-\x1f\x7f]/g, '\ufffd');
+  return cleaned.length > 200 ? `${cleaned.slice(0, 197)}...` : cleaned;
+}
 
 /**
  * Canonical metafile basenames the markdown sync strategy intentionally
@@ -437,6 +501,11 @@ function classifySync(path: string, opts: SyncableOptions = {}): SyncableReason 
   const strategy = opts.strategy || 'markdown';
 
   if (!isAllowedByStrategy(path, strategy)) return 'strategy';
+
+  // Reject filenames that can't be legitimate pages (bracket/control chars —
+  // markdown-link syntax as a literal filename). Checked after `strategy` so
+  // only files that would otherwise be admitted change classification.
+  if (hasMalformedPathSegment(path)) return 'malformed-path';
 
   // Skip every path segment that pruneDir would block walkers from descending
   // into. Catches hidden dirs (`.git`, `.obsidian`), `.raw/` sidecars, and
@@ -506,6 +575,14 @@ export function slugifySegment(segment: string): string {
   return segment
     .normalize('NFD')                     // Decompose accented chars
     .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
+    // #3700: Hebrew niqqud (vowel points) + cantillation are optional
+    // diacritics \u2014 the same word appears pointed and bare across filenames
+    // and must land on ONE slug (the Hebrew analog of caf\u00e9 \u2192 cafe). Scoped
+    // to U+0591\u2013U+05C7 only; \p{M} stays in SLUG_WORD_CHARS so Devanagari
+    // matras, Thai vowels, Arabic text etc. keep their #3417 behavior.
+    // Runs in NFD space so precomposed presentation forms (U+FB1D\u2013FB4F)
+    // are already decomposed and their points strip too.
+    .replace(/[\u0591-\u05c7]/g, '')      // Strip Hebrew niqqud + cantillation
     .normalize('NFC')                     // Recompose Hangul Jamo back to Syllables (v0.32.7)
     .toLowerCase()
     .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
@@ -605,6 +682,8 @@ export {
   resolveAutoSkipThreshold,
   isSkippablePath,
   decideGateAction,
+  EMBEDDING_INFRA_CODES,
+  isEmbeddingInfraCode,
   decideSyncFailureSeverity,
   applySyncFailureGate,
   DEFAULT_SOURCE_ID,

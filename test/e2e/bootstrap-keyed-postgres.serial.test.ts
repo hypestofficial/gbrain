@@ -25,8 +25,13 @@ import { loadCorpusPages } from '../helpers/bootstrap-corpus.ts';
 import { runEmbedCore } from '../../src/commands/embed.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import { runSchemaTransition } from '../../src/core/retrieval-upgrade-planner.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { extractTakesFromPages } from '../../src/core/extract-takes-from-pages.ts';
-import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __unconfigureGatewayForTests,
+} from '../../src/core/ai/gateway.ts';
 import {
   verifyWorkspace,
   VERIFY_PROBE_SLUG,
@@ -230,7 +235,15 @@ describe.skipIf(!OPENAI && !ANTHROPIC)('keyed auto fact-extraction (LLM takes)',
 
   test('keyless → llm_unavailable, zero claims; keyed → a real fact/take lands', async () => {
     // Keyless contrast: no chat gateway ⇒ the sweep cannot extract anything.
-    resetGateway();
+    // NOT resetGateway(): since #3554 that re-applies the preload's test
+    // baseline, whose factory captures env: { ...process.env } — including
+    // the very ANTHROPIC/OPENAI key this describe is gated on (run-e2e.sh
+    // keeps provider keys via GBRAIN_TEST_KEEP_PROVIDER_KEYS=1). The gateway
+    // would come back chat-available and llm_unavailable could never be true.
+    // __unconfigureGatewayForTests() is the #3554 seam for asserting genuine
+    // no-gateway behavior; the preload's beforeEach restores the baseline
+    // before the next test.
+    __unconfigureGatewayForTests();
     const keyless = await extractTakesFromPages(engine, { bootstrapEnabled: true });
     expect(keyless.llm_unavailable).toBe(true);
     expect(keyless.claims_extracted).toBe(0);
@@ -282,12 +295,21 @@ describe.skipIf(!DATABASE_URL)('Postgres bootstrap verify (real Postgres)', () =
     process.env.GBRAIN_HOME = root;
 
     engine = new PostgresEngine();
+    assertSafeE2eDatabaseUrl(DATABASE_URL!);
     await engine.connect({ database_url: DATABASE_URL! });
     await engine.initSchema();
+    // This file runs against the shared e2e DB WITHOUT setupDB's TRUNCATE, so
+    // a prior standalone run's `workspace` source row survives and addSource
+    // (whose `force` only bypasses git validation, not the id-collision check)
+    // would throw source_id_taken. Sweep it first; the FK cascade removes any
+    // leftover pages/facts under it.
+    await engine.executeRaw(`DELETE FROM sources WHERE id = 'workspace'`, []);
     await addSource(engine, { id: 'workspace', localPath: join(ws, 'brain'), force: true });
   }, 60_000);
 
   afterAll(async () => {
+    // Leave the shared DB clean for the next file / next standalone run.
+    try { await engine.executeRaw(`DELETE FROM sources WHERE id = 'workspace'`, []); } catch { /* noop */ }
     try { await engine.disconnect(); } catch { /* noop */ }
     if (prevHome === undefined) delete process.env.GBRAIN_HOME;
     else process.env.GBRAIN_HOME = prevHome;
@@ -311,7 +333,15 @@ describe.skipIf(!DATABASE_URL)('Postgres bootstrap verify (real Postgres)', () =
     const magic = res.checks.find((c) => c.id === 'magic_moment');
     expect(magic?.ok).toBe(true);
 
-    // Probe cleanup [G13] must hold on the Postgres DDL path too.
+    // Probe cleanup [G13] must hold on the Postgres DDL path too. Since
+    // v0.46.6.0 (#4170, closing #4142) verify's probe cleanup HARD-deletes
+    // via the trusted engine primitive — probes are not user content and
+    // verify is a trusted local caller; the old soft-delete path left
+    // tombstones in user brains until the 72h purge. Assert NO probe rows
+    // remain at all, active or tombstoned. (This hunk shipped in #4171
+    // still asserting the pre-#4170 soft-delete contract — the merge-base
+    // collision flagged in that PR's review thread — and broke the Postgres
+    // e2e lane on master; repaired here.)
     const probePages = await engine.executeRaw<{ n: number }>(
       `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1 AND slug IN ($2, $3)`,
       ['workspace', VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],

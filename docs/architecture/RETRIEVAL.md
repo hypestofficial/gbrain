@@ -44,13 +44,13 @@ Three regexes, zero LLM tokens, single SQL `addLinksBatch` call with `INSERT ...
 
 Heuristic link-type inference (`attended`, `works_at`, `invested_in`, `founded`, `advises`) fires from surrounding sentence context — also LLM-free. Power users who want richer types add them via the typed-link blockquote convention.
 
-## ZeroEntropy as reranker: 60% top-1 reshuffle
+## Cross-encoder reranker: 60% top-1 reshuffle
 
-ZeroEntropy's `zerank-2` is the default reranker (on for the `balanced` and `tokenmax` mode bundles, off for `conservative`). On a real-corpus benchmark across 20 queries, zerank-2 reshuffles **60% of top-1 results** after the hybrid + RRF + graph stack. That's the headline number.
+The reranker is on for the `balanced` and `tokenmax` mode bundles, off for `conservative`. New installs with a Voyage key get `rerank-2.5` written as explicit `search.reranker.model` config (the recommended reranker; same `VOYAGE_API_KEY` as embeddings — keyed installs without one get reranking explicitly disabled instead); brains that never set the key still fall back to the legacy ZeroEntropy `zerank-2` mode-bundle default, which is deprecated (the hosted API ends 2026-09-04 — switch with `gbrain config set search.reranker.model voyage:rerank-2.5`) and remains the fallback only until the September cutover. On a real-corpus benchmark across 20 queries, zerank-2 reshuffles **60% of top-1 results** after the hybrid + RRF + graph stack. That's the headline number.
 
 The mechanical reason: hybrid ranking is locally optimal per strategy but globally suboptimal. A cross-encoder reranker reads the query + each candidate document jointly, with full attention. It catches the cases where the vector + keyword + graph signals all agreed on a document that's semantically related but topically wrong.
 
-The cost: +150ms p50 latency, ~$0.025/M tokens. Disabled with `gbrain config set search.reranker.enabled false`. For agent loops that do downstream LLM work after retrieval, the latency is invisible.
+The cost: +150ms p50 latency, ~$0.025–0.05/M tokens depending on the reranker. Disabled with `gbrain config set search.reranker.enabled false`. For agent loops that do downstream LLM work after retrieval, the latency is invisible.
 
 ## Source-aware ranking
 
@@ -71,7 +71,13 @@ more than embedding proximity. Four layers, added after the incident in
   candidates to the best chunk per page (`DISTINCT ON (slug)`) over the full
   candidate set before the user `LIMIT`, via the shared `buildBestPerPagePoolCte`
   in `sql-ranking.ts`. The vector side returns N distinct pages by best chunk,
-  not N chunks that collapse to fewer pages downstream.
+  not N chunks that collapse to fewer pages downstream. When one dense page's
+  chunks fill the inner candidate pool, the engines escalate the pool in a
+  bounded loop (×4 per step, at most 3 escalations; HNSW-backed columns
+  additionally cap at the `ef_search` ceiling) until the page count is honest;
+  a loop that ends still underfilled surfaces `vector_pool_underfilled` on the
+  hybrid layer's `HybridSearchMeta` (the op-layer capture channel) instead of
+  silently returning a short page.
 - **Title-phrase boost** — when the normalized query is a contiguous token-run
   inside `page.title` (or an exact full-title match), a floor-ratio-gated,
   bounded multiplier fires (`applyTitleBoost`, `search.title_boost` knob). A
@@ -86,7 +92,12 @@ more than embedding proximity. Four layers, added after the incident in
   (`alias_hit | exact_title_match | high_vector_match | keyword_exact |
   weak_semantic`) and `create_safety` (`exists | probable | unknown`). An agent
   deciding "is this page already here, safe to NOT write a duplicate?" keys off
-  `create_safety`, not a raw blended score.
+  `create_safety`, not a raw blended score. `high_vector_match` is grounded in
+  the result's real query↔chunk cosine (`SearchResult.cosine` at/above
+  `search.evidence_cosine_floor`, default 0.80) — never the blended score, so a
+  keyword+boost pile-up can't read as semantic support; keyless runs have no
+  cosine and degrade to honest keyword-based labels. `gbrain search --explain`
+  prints each result's raw cosine next to its blended score.
 
 **Extraction quarantine lane (issue #160):** pages carrying the unverified
 auto-extracted markers (frontmatter `provenance: auto-extracted` +
@@ -108,11 +119,12 @@ specific miss with `gbrain search diagnose "<q>" --target <slug>`.
 
 ## Intent-aware query rewriting
 
-`src/core/search/query-intent.ts` classifies queries into `entity`, `temporal`, `event`, or `general`. Each routes through different ranking knobs:
+`src/core/search/query-intent.ts` classifies queries into `entity`, `temporal`, `event`, `concept`, or `general`. Each routes through different ranking knobs:
 
 - **Entity** queries ("who works at X?") apply a higher graph-traversal weight.
 - **Temporal** queries ("what happened last week?") bypass source-boost so chat/daily pages surface.
 - **Event** queries ("Acme AI Series A") engage the timeline index.
+- **Concept** queries ("what is the ownership economy?", "find all the companies doing offshore wind" — definitional paraphrases and landscape/quantifier phrasings with no proper noun) rank vector-lean, so keyword-decoy pages stop outranking the page that actually explains the idea. Proper nouns, quoted phrases, and sub-3-word queries never classify as concept — they keep their existing routing.
 - **General** queries hit the standard hybrid stack.
 
 The classifier is deterministic (no LLM call). Wrong classification degrades gracefully — the hybrid stack still works without it.
@@ -147,13 +159,18 @@ hybrid recall + fusion:
 graph augment (optional two-pass structural expansion — walkDepth > 0)
        │
        ▼
-deduplication (4-layer: per-page cap, Jaccard, type diversity)
+deduplication (4-layer: per-page cap, same-page Jaccard, type diversity)
        │
        ▼
-reranker (zerank-2 cross-encoder — balanced/tokenmax; fail-open)
+reranker (cross-encoder — balanced/tokenmax; fail-open)
        │
        ▼
 alias hop (exact alias match injects/boosts the canonical page)
+       │
+       ▼
+exact-lookup tier (lookup-shaped queries only: slug + exact-title probes
+   promote/inject the identity page at rank-1; supersession-filtered;
+   fail-open — src/core/search/exact-lookup.ts)
        │
        ▼
 evidence stamp → adaptive return (opt-in) → autocut (reranked modes)
@@ -162,7 +179,7 @@ evidence stamp → adaptive return (opt-in) → autocut (reranked modes)
 limit slice → token-budget enforcement (per mode bundle)
        │
        ▼
-results
+results (+ retrieval-confidence grade in query-op meta — crag.ts)
 ```
 
 The stage order is pinned by `hybridSearch` in `src/core/search/hybrid.ts`:
@@ -172,6 +189,23 @@ that is a page's declared name reliably surfaces that page regardless of how
 the reranker scored body chunks), and the token budget is enforced last, on
 the final slice.
 
+Two cross-cutting seams sit around the pipeline rather than inside it:
+
+- **Private-page visibility.** For untrusted (remote/MCP) callers, every
+  recall arm filters `visibility: private` pages via the shared predicate in
+  `src/core/search/private-visibility.ts` (fail-closed default; operator
+  opt-outs documented in `docs/operations/mcp-surface-runbook.md`). The
+  posture folds into the query-cache key, so trusted and untrusted runs never
+  share cache rows.
+- **CRAG-style confidence gate.** `src/core/search/crag.ts` grades every
+  `query` op result (`strong`/`moderate`/`weak`) from the already-stamped
+  honesty signals — zero LLM, zero added latency — and attaches the grade to
+  response meta. Config-gated and default OFF: `search.crag_escalation=true`
+  re-runs a weak retrieval once at a higher ceiling (expansion + relational +
+  wide limit, autocut off) and keeps the better-graded run;
+  `search.crag_think=true` (local callers) escalates a still-weak result to
+  `think`.
+
 ### Autocut: score-discontinuity result-sizing
 
 Default-on for `balanced` and `tokenmax` (off for `conservative`, which has no
@@ -180,8 +214,12 @@ reranker and therefore no trustworthy cliff signal). `applyAutocut`
 cross-encoder rerank-score cliff, before the limit slice, first page only.
 Never-empty failsafe (`minKeep`), no-op when fewer than 2 results carry a
 finite rerank score (covers the fail-open reranker path), and alias-hop exact
-matches are preserved through the cut. Knobs: per-call `SearchOpts.autocut` →
-`search.autocut` / `search.autocut_jump` config → mode bundle.
+matches are preserved through the cut. Weak-top floor: when the top rerank
+score is below `minTopScore` (default 0.35, config `search.autocut_min_top`),
+cliff trimming is skipped entirely — a low-confidence list returns the full
+cluster for the caller to judge instead of collapsing to one result. Knobs:
+per-call `SearchOpts.autocut` → `search.autocut` / `search.autocut_jump` /
+`search.autocut_min_top` config → mode bundle.
 
 Each stage is testable in isolation. Each stage is replaceable. The whole pipeline is < 1ms of orchestration cost; the latency budget goes to the upstream HTTP calls (embedding, rerank) and the index scans.
 

@@ -23,7 +23,7 @@ gbrain config set spend.posture gated      # default — gates enforce
 | Value | Effect |
 |-------|--------|
 | `gated` (default) | Every cost gate enforces its limit as documented below. |
-| `tokenmax` | Every embedding-spend gate in the table below prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. (Commands with their own LLM cost caps outside this doc's embedding scope — e.g. `extract-conversation-facts --max-cost-usd` — don't resolve posture; their per-call flags govern.) |
+| `tokenmax` | Every embedding-spend gate in the table below prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. (Commands with their own LLM cost caps outside this doc's embedding scope — e.g. `extract-conversation-facts --max-cost-usd`, `dream retriage --max-usd` (an estimate-based soft stop) — don't resolve posture; their per-call flags govern.) |
 
 `spend.posture` is deliberately separate from `search.mode=tokenmax` (which governs
 retrieval payload size, not embedding spend). When a gate fires and
@@ -56,6 +56,7 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 | `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 2 | `--max-cost off` | informational |
 | `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 2 | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
 | `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | refuse without a cap (non-TTY) | `--max-usd off` | runs uncapped (still ledgered) |
+| Image-OCR per-run ceiling (#3973) | `embedding_image_ocr_max_images` / `embedding_image_ocr_max_usd` | `200` images / `$1.00` (estimated) | skips OCR over-cap (import continues; skips counted in `ocr_skipped_budget`, surfaced by doctor `ocr_health`) | `0` disables that cap | **not** bypassed (per-run cap, not a tracker gate) |
 
 ### Sync inline-embed cost gate
 
@@ -96,6 +97,44 @@ estimate is `delta + stale backlog`, labeled as such.
 - **Recovery under parallel:** `--skip-failed` / `--retry-failed` work under parallel
   sync (the failure ledger is per-source and lock-serialized) — you no longer have to
   drop to `--serial`, which is what used to arm the inline gate.
+- **Chat-side accounting completeness:** query-expansion and image-OCR calls record
+  on the ambient budget tracker like every other gateway call, including failed
+  attempts (recorded pessimistically). This is record-only — these paths never
+  pre-reserve, so a cap breach from them surfaces on the next reserving call.
+  Practical effect: capped runs (`--max-cost` and friends) that previously
+  under-counted may now hit their ceiling; the new number is the honest one, so
+  raise the cap rather than assuming a regression.
+
+## Operator price overrides (`pricing.overrides`)
+
+Cost caps are fail-closed: when `--max-cost` (or a phase's default cap) is set
+and a model has no shipped pricing row, the budget tracker aborts with
+`no_pricing` rather than pretend the call is free. Proxy routes hit this by
+design — a LiteLLM endpoint can front a paid provider, so `litellm:*` models
+are deliberately absent from both the pricing tables and the free-local sets.
+
+Declare your real rate in the config plane instead:
+
+```bash
+# Scalar = one USD-per-1M-token rate for input AND output (natural for embeddings):
+gbrain config set pricing.overrides '{"litellm:text-embedding-3-large": 0.13}'
+
+# Object form for chat models with distinct input/output rates:
+gbrain config set pricing.overrides \
+  '{"litellm:gpt-4o": {"input": 2.5, "output": 10}, "litellm:text-embedding-3-large": 0.13}'
+```
+
+Semantics:
+
+- Keys are full `provider:model` strings (case-insensitive, exact match).
+- Overrides win over shipped tables — you own your bill (negotiated rates,
+  markup-charging proxies).
+- Models with neither a table row nor an override stay fail-closed under a cap.
+- Invalid entries (negative, non-numeric) are dropped; those models keep the
+  fail-closed behavior.
+- Consumed by `BudgetTracker` construction (enrich and the cycle's
+  `enrich_thin` phase load it automatically); both chat and embed routes price
+  through it.
 
 ## Escape hatches at a glance
 

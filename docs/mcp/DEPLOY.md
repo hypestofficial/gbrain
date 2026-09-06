@@ -29,7 +29,7 @@ No server, no tunnel, no token needed. Works on both PGLite and Postgres engines
 `--surface verbs` exposes exactly the seven-verb memory protocol (`recall`,
 `remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
 [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
-`--surface starter` sits between (~26 ops: the verbs plus the daily-driver set);
+`--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
 omit the flag (default `full`) for every operation.
 
 ### Remote over OAuth 2.1 (recommended)
@@ -333,6 +333,29 @@ Operator checklist:
 
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
+
+### Run gbrain under a real init (tini / `--init`)
+
+If `gbrain serve` is your container's entrypoint, it runs as PID 1 and
+inherits every orphaned process in the container. Prefer a real init so
+orphan exits are reaped by something built for the job:
+
+```dockerfile
+# Dockerfile: wrap the entrypoint with tini
+ENTRYPOINT ["/usr/bin/tini", "--", "gbrain", "serve", "--http"]
+```
+
+or at run time:
+
+```bash
+docker run --init ... gbrain serve --http
+```
+
+Without an init, gbrain installs its own PID-1 orphan reaper (Linux only):
+a low-frequency `/proc` scan that `waitpid()`s zombies re-parented to it,
+so long-lived containers don't accumulate defunct entries in the PID table.
+It is fail-open and can be disabled with `GBRAIN_PID1_REAP=0` — but tini /
+`--init` remains the recommended setup.
 
 ## Troubleshooting
 

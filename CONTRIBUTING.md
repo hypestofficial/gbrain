@@ -32,7 +32,7 @@ frontmatter will read as absent. Refresh it once, from the repository root:
 git rm --cached -r . -q
 git reset --hard
 bash -n scripts/run-unit-parallel.sh          # silence means bash can read the scripts
-git ls-files --eol -- '*.md' | grep -c w/crlf # 0 means Markdown is clean
+git ls-files --eol -- '*.md' | grep -cE 'w/(crlf|mixed)' # 0 means Markdown is clean
 ```
 
 Every `check:*` entry in `package.json` invokes its script as `bash scripts/<name>.sh`
@@ -45,14 +45,21 @@ directly. Keep that prefix when you add a new shell-script check.
 src/
   cli.ts                  CLI entry point
   commands/               CLI-only commands (init, upgrade, import, export, etc.)
+    doctor.ts             gbrain doctor façade (buildChecks/runDoctor/output)
+    doctor/               Peeled doctor modules: checks/* bundles + tail clusters
+    sync.ts               gbrain sync CLI + performSync/performFullSync
   core/
-    operations.ts         Contract-first operation definitions (the foundation)
+    operations.ts         Operation contract assembly (façade over ops/)
+    ops/                  Contract types + security fences + the op domain modules
     engine.ts             BrainEngine interface
     engine-factory.ts     Engine factory (dynamic import of the configured engine)
-    postgres-engine.ts    Postgres + pgvector implementation
-    pglite-engine.ts      PGLite (embedded Postgres via WASM) implementation
+    postgres-engine.ts    Postgres + pgvector implementation (façade)
+    postgres-engine/      Narrow-deps engine modules (facts, takes, code-edges, salience)
+    pglite-engine.ts      PGLite (embedded Postgres via WASM) implementation (façade)
+    pglite-engine/        Narrow-deps engine modules (facts, takes, code-edges, salience)
     db.ts                 Connection management + schema loader
     import-file.ts        Import pipeline (chunk + embed + tags)
+    sync-*.ts             Peeled sync clusters (cost-gate, git, anchor, lock, reconcile, status-report, ...)
     types.ts              TypeScript types
     markdown.ts           Frontmatter parsing
     config.ts             Config file management
@@ -65,7 +72,7 @@ src/
     yaml-lite.ts          Lightweight YAML parser
     chunkers/             3-tier chunking (recursive, semantic, llm)
     search/               Hybrid search (vector, keyword, hybrid, expansion, dedup)
-    embedding.ts          Embedding service (provider-routed; ZeroEntropy default)
+    embedding.ts          Embedding service (provider-routed; Voyage default)
   mcp/
     server.ts             MCP stdio server (generated from operations)
     http-transport.ts     HTTP MCP transport (OAuth, body caps)
@@ -92,11 +99,11 @@ The canonical reference for test tiers, isolation rules, timing, and the E2E
 lifecycle is [`docs/TESTING.md`](docs/TESTING.md). The short version:
 
 ```bash
-# Inner edit loop (~85s on a Mac dev box)
-bun run test                      # parallel 4-shard fan-out (memory-adaptive) + serial post-pass
+# Inner edit loop (~8min full suite on a Mac dev box; single files in seconds)
+bun run test                      # parallel 4-shard fan-out (memory-adaptive) + serial post-pass; PGLite snapshot default-on
 bun test test/markdown.test.ts    # specific unit test
 
-# Pre-push gate (19+ parallel checks + typecheck)
+# Pre-push gate (40+ parallel checks + typecheck)
 bun run verify
 
 # Pre-merge sanity (everything CI runs)
@@ -115,7 +122,19 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run t
 DATABASE_URL=postgresql://... bun run test:e2e
 ```
 
-Use `bun run verify` before pushing. It runs 19+ guard checks in parallel
+Heads-up: a bare `bun test` refuses to start while `DATABASE_URL` or
+`GBRAIN_DATABASE_URL` is set in your environment — some tests run destructive
+SQL against whatever those URLs point at. Unset the variable for unit runs
+(they need no database) or use the wrappers: the unit/slow runners strip the
+variables at their boundary, and `bun run test:e2e` opts in at its own. The
+refusal message walks you through it; details in
+[`docs/TESTING.md`](docs/TESTING.md) ("Database-URL run guard"). If you point
+`bun run test:e2e` at your own Postgres or Supabase, a second floor applies:
+the database name must carry "test" as a word segment (like `gbrain_test`
+above) or destructive tests refuse to run — opt a differently-named database
+in one-shot with `GBRAIN_E2E_ALLOW_DB=<name>`.
+
+Use `bun run verify` before pushing. It runs 40+ guard checks in parallel
 (`scripts/run-verify-parallel.sh`), including: banned fork-name leaks
 (`scripts/check-privacy.sh`), `JSON.stringify(x)::jsonb` interpolation
 patterns (`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
@@ -124,8 +143,14 @@ patterns (`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
 loop" below), silent fallback to recursive chunking in the compiled binary
 (`scripts/check-wasm-embedded.sh`), stale admin-dashboard build artifacts
 (`scripts/check-admin-build.sh`), resolver drift on bundled skills
-(`bun run check:resolver`), and typecheck. `bun run check:all` runs the full
-historical sweep including the trailing-newline and exports-count checks.
+(`bun run check:resolver`), and typecheck. The guard REGISTRY is
+`scripts/guards-manifest.tsv`, and `scripts/guard-self-test.sh` (also in
+`verify`) proves each self-tested scanner guard (`selftest=yes` in the
+manifest; coverage ratchets up from the `todo` rows) can actually fail by
+running it against known-bad fixtures — a new `scripts/check-*` guard must be
+registered in the manifest or the build fails. There is no `check:all` script; the
+trailing-newline, exports-count, and no-legacy-getconnection checks run in
+`verify` with everything else.
 
 ### Writing tests that survive the parallel loop
 
@@ -146,6 +171,46 @@ a paired `afterAll(disconnect)`.
 — read that before writing a new test file.** Files that predate the rules are
 listed in `scripts/check-test-isolation.allowlist`; the allow-list MUST shrink
 over time — never add new entries.
+
+### Discrimination test — required for every fix (#3665)
+
+A fix's test is only worth anything if it **fails without the fix**. A test
+that passes both ways is worse than no test: it inflates reviewer confidence,
+gets weighted into the CI shards forever, and keeps passing after a future
+refactor silently breaks the behavior. (An adversarial review pass found PRs
+where 7 of 8 new tests passed on master.)
+
+Every PR that fixes behavior must fill the **Discrimination test** field in
+the PR template with the actual result of checking this:
+
+> Discrimination test: reverted `<source file(s)>` to `<ref>`, ran
+> `<test file>` → `N pass / M fail`. Restored → all pass.
+
+The helper does the whole dance in one command:
+
+```bash
+bash scripts/check-test-discriminates.sh <test-file> <source-file> [<source-file>...]
+```
+
+It reverts the source files to the pre-fix state (plain file copies, no git
+stash), runs the test file, requires at least one EXECUTED test to fail —
+exit ≠ 0 alone does not count, because a missing file or import crash also
+exits non-zero (exit 3, the vacuous-failure class) — restores, and prints the
+paste-ready field line. Exit 1 means the test passed with the fix reverted:
+tighten the assertions before asking for review.
+
+Vacuous-assertion shapes to avoid (they recur):
+- asserting only `exit ≠ 0` (a missing binary also exits non-zero);
+- asserting membership in a set that covers every reachable value
+  (`['warn','fail']` when those are the only outputs);
+- asserting a substring that would also appear in the broken output —
+  assert parsed structure instead.
+
+Relatedly: a test whose only assertion is a regex over `readFileSync`'d
+source text pins spelling, not behavior. New tests that read `src/` text
+need a `test-reads-source-ok: <why>` comment (or a behavioral assertion
+alongside); `test/test-reads-source-smell.test.ts` enforces this for new
+files and ratchets the pre-existing list down.
 
 ### Local CI gate (recommended before pushing)
 
@@ -168,10 +233,12 @@ narrower mappings via `scripts/e2e-test-map.ts`.
 ### PR-side security checks
 
 Besides the test gate, PRs may trigger three security workflows: Semgrep CE
-SAST (every PR — **advisory/non-blocking** while the baseline is tuned, so a
-Semgrep finding won't fail your PR), OSV-Scanner (only when `package.json` or
-`bun.lock` change), and actionlint (only when `.github/workflows/**` change).
-See `SECURITY.md` → "Automated security scanning" for details.
+SAST (every PR — **blocking for findings new since the PR base**, so a net-new
+issue fails the check while pre-existing findings never block an unrelated PR;
+scheduled/dispatch runs do a full-tree report-only scan), OSV-Scanner (only when
+`package.json` or `bun.lock` change), and actionlint (only when
+`.github/workflows/**` change). See `SECURITY.md` → "Automated security
+scanning" for details.
 
 ## Building
 
@@ -181,10 +248,16 @@ bun build --compile --outfile bin/gbrain src/cli.ts
 
 ## Adding a new operation
 
-GBrain uses a contract-first architecture. Add your operation to one file and it
-automatically appears in the CLI, MCP server, and tools-json:
+GBrain uses a contract-first architecture. Add your operation to one domain module
+and it automatically appears in the CLI, MCP server, and tools-json:
 
-1. Add your operation to `src/core/operations.ts` (define params, handler, cliHints)
+1. Add your operation to the matching domain module under `src/core/ops/`
+   (`pages.ts`, `search.ts`, `takes.ts`, `jobs.ts`, ... — define params, handler,
+   cliHints there). `src/core/operations.ts` is the assembly façade that spreads
+   every domain module into the single `operations` array: a new op in an existing
+   domain needs no façade change; a brand-new domain module gets one spread line
+   in `operations.ts`. Shared contract types live in `src/core/ops/contract.ts`,
+   the security/scope fences in `src/core/ops/context.ts`.
 2. Add tests
 3. That's it. The CLI, MCP server, and tools-json are generated from operations.
 
@@ -280,9 +353,9 @@ Trigger paths (rerun if your diff touches any of these):
 
 - `src/core/search/hybrid.ts`
 - `src/core/search/source-boost.ts`, `sql-ranking.ts`
-- `src/core/search/intent.ts`, `expansion.ts`, `dedup.ts`
+- `src/core/search/query-intent.ts`, `expansion.ts`, `dedup.ts`
 - `src/core/embedding.ts`
-- `src/core/operations.ts` (query / search handlers)
+- `src/core/ops/search.ts` (query / search op handlers)
 - `src/core/postgres-engine.ts` / `pglite-engine.ts` (searchKeyword /
   searchVector SQL)
 
